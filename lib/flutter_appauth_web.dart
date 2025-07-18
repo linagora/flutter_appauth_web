@@ -7,6 +7,7 @@ import 'dart:math';
 import 'dart:typed_data';
 import 'dart:html' as html;
 import 'dart:core';
+import 'package:flutter_appauth_web/authorization_exception.dart';
 import 'package:flutter_web_plugins/flutter_web_plugins.dart';
 import 'package:http/http.dart' as http;
 
@@ -32,11 +33,11 @@ class AppAuthWebPlugin extends FlutterAppAuthPlatform {
   }
 
   @override
-  Future<AuthorizationTokenResponse?> authorizeAndExchangeCode(AuthorizationTokenRequest request) async {
-    final authUrl = html.window.sessionStorage[_AUTHORIZE_DESTINATION_URL];
-    if (authUrl != null || authUrl != null && authUrl.isNotEmpty) return null;
-
-    final authResult = await authorize(AuthorizationRequest(request.clientId, request.redirectUrl,
+  Future<AuthorizationTokenResponse> authorizeAndExchangeCode(AuthorizationTokenRequest request,) async {
+    final authResult = await authorize(
+      AuthorizationRequest(
+        request.clientId,
+        request.redirectUrl,
         loginHint: request.loginHint,
         scopes: request.scopes,
         serviceConfiguration: request.serviceConfiguration,
@@ -44,10 +45,11 @@ class AppAuthWebPlugin extends FlutterAppAuthPlatform {
         allowInsecureConnections: request.allowInsecureConnections!,
         discoveryUrl: request.discoveryUrl,
         issuer: request.issuer,
-        preferEphemeralSession: request.preferEphemeralSession!,
-        promptValues: request.promptValues));
-
-    if (authResult == null) return null;
+        externalUserAgent: request.externalUserAgent ??
+            ExternalUserAgent.asWebAuthenticationSession,
+        promptValues: request.promptValues,
+      ),
+    );
 
     final tokenResponse = await requestToken(TokenRequest(request.clientId, request.redirectUrl,
         clientSecret: request.clientSecret,
@@ -64,7 +66,7 @@ class AppAuthWebPlugin extends FlutterAppAuthPlatform {
   }
 
   @override
-  Future<AuthorizationResponse?> authorize(AuthorizationRequest request) async {
+  Future<AuthorizationResponse> authorize(AuthorizationRequest request) async {
     String? codeVerifier;
 
     // check if we already have login-callback data
@@ -73,7 +75,9 @@ class AppAuthWebPlugin extends FlutterAppAuthPlatform {
       html.window.sessionStorage.remove(_AUTH_RESPONSE_INFO);
 
       codeVerifier = html.window.sessionStorage[_CODE_VERIFIER_STORAGE];
-      if (codeVerifier == null || codeVerifier.isEmpty) return null;
+      if (codeVerifier == null || codeVerifier.isEmpty) {
+        throw ArgumentError(_AUTHORIZE_ERROR_MESSAGE_FORMAT.replaceAll("%1", _AUTHORIZE_ERROR_CODE).replaceAll("%2", 'No code verifier found'));
+      }
       html.window.sessionStorage.remove(_CODE_VERIFIER_STORAGE);
 
       return processLoginResult(authUrl, codeVerifier);
@@ -108,7 +112,7 @@ class AppAuthWebPlugin extends FlutterAppAuthPlatform {
         html.window.sessionStorage[_AUTHORIZE_DESTINATION_URL] = html.window.location.href;
         html.window.sessionStorage[_CODE_VERIFIER_STORAGE] = codeVerifier;
         html.window.location.assign(authUri);
-        return null;
+        throw AutoRedirectToAppAfterStoreAuthorizeDestinationUrlException();
         // loginResult = await openPopUp(authUri, 'auth', 640, 600, true);
       }
     } on StateError catch (err) {
@@ -124,7 +128,7 @@ class AppAuthWebPlugin extends FlutterAppAuthPlatform {
   }
 
   @override
-  Future<EndSessionResponse?> endSession(EndSessionRequest request) async {
+  Future<EndSessionResponse> endSession(EndSessionRequest request) async {
     final AuthorizationServiceConfiguration serviceConfiguration = await getConfiguration(request.serviceConfiguration, request.discoveryUrl, request.issuer);
     String uri = "${serviceConfiguration.endSessionEndpoint}?id_token_hint=${request.idTokenHint}";
 
