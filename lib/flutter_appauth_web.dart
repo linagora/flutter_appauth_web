@@ -19,14 +19,14 @@ class AppAuthWebPlugin extends FlutterAppAuthPlatform {
   static const String _charset = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~';
   static const String _DISCOVERY_ERROR_MESSAGE_FORMAT = "Error retrieving discovery document: [error: discovery_failed, description: %2]";
   static const String _TOKEN_ERROR_MESSAGE_FORMAT = "Failed to get token: [error: token_failed, description: %2]";
-  static const String _AUTHORIZE_ERROR_MESSAGE_FORMAT = "Failed to authorize: [error: %1, description: %2]";
-
-  static const String _AUTHORIZE_AND_EXCHANGE_CODE_ERROR_CODE = "authorize_and_exchange_code_failed";
-  static const String _AUTHORIZE_ERROR_CODE = "authorize_failed";
 
   static const String _CODE_VERIFIER_STORAGE = "auth_code_verifier";
   static const String _AUTHORIZE_DESTINATION_URL = "auth_destination_url";
   static const String _AUTH_RESPONSE_INFO = "auth_info";
+  static const String _STATE_STORAGE = "auth_request_state";
+
+  Uri? _redirectUri;
+  bool _isAuthorizing = false;
 
   static registerWith(Registrar registrar) {
     FlutterAppAuthPlatform.instance = AppAuthWebPlugin();
@@ -67,59 +67,63 @@ class AppAuthWebPlugin extends FlutterAppAuthPlatform {
 
   @override
   Future<AuthorizationResponse> authorize(AuthorizationRequest request) async {
-    String? codeVerifier;
-
-    // check if we already have login-callback data
-    final authUrl = html.window.sessionStorage[_AUTH_RESPONSE_INFO];
-    if (authUrl != null && authUrl.isNotEmpty) {
-      html.window.sessionStorage.remove(_AUTH_RESPONSE_INFO);
-
-      codeVerifier = html.window.sessionStorage[_CODE_VERIFIER_STORAGE];
-      if (codeVerifier == null || codeVerifier.isEmpty) {
-        throw ArgumentError(_AUTHORIZE_ERROR_MESSAGE_FORMAT.replaceAll("%1", _AUTHORIZE_ERROR_CODE).replaceAll("%2", 'No code verifier found'));
-      }
-      html.window.sessionStorage.remove(_CODE_VERIFIER_STORAGE);
-
-      return processLoginResult(authUrl, codeVerifier);
-    }
-
-    final serviceConfiguration = await getConfiguration(request.serviceConfiguration, request.discoveryUrl, request.issuer);
-
-    request.serviceConfiguration = serviceConfiguration; //Fill in the values from the discovery doc if needed for future calls.
-    codeVerifier = List.generate(128, (i) => _charset[Random.secure().nextInt(_charset.length)]).join();
-
-    final codeChallenge = base64Url.encode(SHA256Digest().process(Uint8List.fromList(codeVerifier.codeUnits))).replaceAll('=', '');
-
-    var responseType = "code";
-
-    var authUri =
-        "${serviceConfiguration.authorizationEndpoint}?client_id=${request.clientId}&redirect_uri=${Uri.encodeQueryComponent(request.redirectUrl)}&response_type=$responseType&scope=${Uri.encodeQueryComponent(request.scopes!.join(' '))}&code_challenge_method=S256&code_challenge=$codeChallenge";
-
-    if (request.loginHint != null) authUri += "&login_hint=${Uri.encodeQueryComponent(request.loginHint!)}";
-
-    if (request.promptValues != null)
-      request.promptValues!.forEach((element) {
-        authUri += "&prompt=$element";
-      });
-    if (request.additionalParameters != null) request.additionalParameters!.forEach((key, value) => authUri += "&$key=$value");
-
-    String loginResult;
+    if (_isAuthorizing) throw StateError('Authorization is already in progress');
+    _isAuthorizing = true;
+    var redirecting = false;
     try {
-      if (request.promptValues != null && request.promptValues!.contains("none")) {
-        //Do this in an iframe instead of a popup because this is a silent renew
-        loginResult = await openIframe(authUri, 'auth');
-      } else {
-        html.window.sessionStorage[_AUTHORIZE_DESTINATION_URL] = html.window.location.href;
-        html.window.sessionStorage[_CODE_VERIFIER_STORAGE] = codeVerifier;
-        html.window.location.assign(authUri);
-        throw AutoRedirectToAppAfterStoreAuthorizeDestinationUrlException();
-        // loginResult = await openPopUp(authUri, 'auth', 640, 600, true);
+      _redirectUri = Uri.parse(request.redirectUrl);
+      final authUrl = html.window.sessionStorage[_AUTH_RESPONSE_INFO];
+      // An empty response is still a callback attempt, not a new sign-in.
+      if (authUrl != null) {
+        final verifier = html.window.sessionStorage[_CODE_VERIFIER_STORAGE] ?? '';
+        return processLoginResult(authUrl, verifier);
       }
-    } on StateError catch (err) {
-      throw StateError(_AUTHORIZE_ERROR_MESSAGE_FORMAT.replaceAll("%1", _AUTHORIZE_AND_EXCHANGE_CODE_ERROR_CODE).replaceAll("%2", err.message));
-    }
 
-    return processLoginResult(loginResult, codeVerifier);
+      final configuration = await getConfiguration(
+        request.serviceConfiguration, request.discoveryUrl, request.issuer);
+      request.serviceConfiguration = configuration;
+      final random = Random.secure();
+      final verifier = List.generate(128,
+        (_) => _charset[random.nextInt(_charset.length)]).join();
+      final challenge = base64Url.encode(SHA256Digest().process(
+        Uint8List.fromList(verifier.codeUnits))).replaceAll('=', '');
+      final state = base64Url.encode(List.generate(32,
+        (_) => random.nextInt(256))).replaceAll('=', '');
+      html.window.sessionStorage[_STATE_STORAGE] = state;
+      html.window.sessionStorage[_CODE_VERIFIER_STORAGE] = verifier;
+
+      // Uri encodes both keys and values; additional parameters cannot inject
+      // a second state or override the generated authorization/PKCE parameters.
+      final endpoint = Uri.parse(configuration.authorizationEndpoint);
+      final authUri = endpoint.replace(queryParameters: <String, dynamic>{
+        ...endpoint.queryParametersAll,
+        ...?request.additionalParameters,
+        'client_id': request.clientId,
+        'redirect_uri': request.redirectUrl,
+        'response_type': 'code',
+        'scope': request.scopes?.join(' ') ?? '',
+        'code_challenge_method': 'S256',
+        'code_challenge': challenge,
+        'state': state,
+        if (request.loginHint != null) 'login_hint': request.loginHint!,
+        if (request.promptValues != null) 'prompt': request.promptValues!,
+      }).toString();
+
+      if (request.promptValues?.contains('none') == true) {
+        return processLoginResult(await openIframe(authUri, 'auth'), verifier);
+      }
+      html.window.sessionStorage[_AUTHORIZE_DESTINATION_URL] = html.window.location.href;
+      html.window.location.assign(authUri);
+      throw AutoRedirectToAppAfterStoreAuthorizeDestinationUrlException();
+    } on AutoRedirectToAppAfterStoreAuthorizeDestinationUrlException {
+      // The new document resumes this transaction using sessionStorage.
+      redirecting = true;
+      rethrow;
+    } finally {
+      if (!redirecting) _clearTransaction();
+      _redirectUri = null;
+      _isAuthorizing = false;
+    }
   }
 
   @override
@@ -183,23 +187,51 @@ class AppAuthWebPlugin extends FlutterAppAuthPlatform {
     );
   }
 
-  //returns null if full login is required
   AuthorizationResponse processLoginResult(String loginResult, String codeVerifier) {
-    var resultUri = Uri.parse(loginResult.toString());
+    try {
+      final result = Uri.tryParse(loginResult);
+      final redirect = _redirectUri;
+      if (result == null || redirect == null || !result.hasAuthority ||
+          result.scheme != redirect.scheme || result.host != redirect.host ||
+          result.port != redirect.port || result.userInfo.isNotEmpty ||
+          _callbackPath(result) != _callbackPath(redirect) || result.hasFragment) {
+        throw StateError('Invalid OAuth callback URL');
+      }
+      final parameters = result.queryParametersAll;
+      final state = html.window.sessionStorage[_STATE_STORAGE];
+      final states = parameters['state'];
+      final codes = parameters['code'];
+      if (state == null || state.isEmpty || states == null ||
+          states.length != 1 || states.single != state ||
+          codes == null || codes.length != 1 || codes.single.isEmpty ||
+          parameters.containsKey('error')) {
+        throw StateError('Invalid OAuth authorization response');
+      }
+      if (codeVerifier.isEmpty ||
+          codeVerifier != html.window.sessionStorage[_CODE_VERIFIER_STORAGE]) {
+        throw ArgumentError('No matching code verifier found');
+      }
+      return AuthorizationResponse(
+        authorizationCode: codes.single,
+        codeVerifier: codeVerifier,
+        authorizationAdditionalParameters: result.queryParameters,
+      );
+    } finally {
+      // Consume the transaction synchronously, including rejected callbacks,
+      // before any token exchange can begin.
+      _clearTransaction();
+    }
+  }
 
-    final error = resultUri.queryParameters['error'];
+  String _callbackPath(Uri uri) =>
+      uri.path.isEmpty && (uri.scheme == 'https' || uri.scheme == 'http')
+          ? '/' : uri.path;
 
-    if (error != null && error.isNotEmpty) throw ArgumentError(_AUTHORIZE_ERROR_MESSAGE_FORMAT.replaceAll("%1", _AUTHORIZE_ERROR_CODE).replaceAll("%2", error));
-
-    var authCode = resultUri.queryParameters['code'];
-    if (authCode == null || authCode.isEmpty)
-      throw ArgumentError(_AUTHORIZE_ERROR_MESSAGE_FORMAT.replaceAll("%1", _AUTHORIZE_ERROR_CODE).replaceAll("%2", 'Login request returned no code'));
-
-    return AuthorizationResponse(
-      authorizationCode: authCode,
-      codeVerifier: codeVerifier,
-      authorizationAdditionalParameters: resultUri.queryParameters,
-    );
+  void _clearTransaction() {
+    for (final key in [_STATE_STORAGE, _AUTH_RESPONSE_INFO,
+      _CODE_VERIFIER_STORAGE, _AUTHORIZE_DESTINATION_URL]) {
+      html.window.sessionStorage.remove(key);
+    }
   }
 
   //to-do Cache this based on the url
@@ -239,7 +271,6 @@ class AppAuthWebPlugin extends FlutterAppAuthPlatform {
 
     html.window.onMessage.first.then((event) {
       final url = event.data.toString();
-      print(url);
       c.complete(url);
       child.close();
     });
@@ -270,7 +301,6 @@ class AppAuthWebPlugin extends FlutterAppAuthPlatform {
 
     html.window.onMessage.first.then((event) {
       final url = event.data.toString();
-      print(url);
       c.complete(url);
       html.querySelector("body")?.children.remove(child);
     });
